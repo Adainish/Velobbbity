@@ -6,8 +6,8 @@ public class VelobbityPlayer
 {
     public UUID uuid;
     public String username;
-    public String lastServer;
-    public String desiredServer;
+    public String lastServer = "";
+    public String desiredServer = "";
 
     public VelobbityPlayer(UUID uuid)
     {
