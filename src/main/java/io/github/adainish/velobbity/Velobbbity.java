@@ -34,7 +34,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 @Plugin(
         id = "velobbity",
@@ -223,15 +222,11 @@ public class Velobbbity {
         });
     }
 
-    //method to get first available lobby server to distribute player
-
     public QueueServer getAndSendAvailableLobbyServer(AdaptedPlayer player, VelobbityPlayer velobbityPlayer, String desiredServer) {
         QueueServer availableServer = null;
         ImmutableList<QueueServer> servers = ajQueueAPI.getQueueManager().getServers();
         for (int i = 0, serversSize = servers.size(); i < serversSize; i++) {
             QueueServer queueServer = servers.get(i);
-            logger.atLevel(Level.INFO).log("Checking server: " + queueServer.getName());
-            configuredLobbyServers.values().forEach(lobbyServer -> logger.atLevel(Level.INFO).log("Lobby server: " + lobbyServer.serverName));
             if (configuredLobbyServers.containsKey(queueServer.getName())) {
                 //check if server is full
                 if (queueServer.isOnline() && queueServer.isJoinable(player)) {
