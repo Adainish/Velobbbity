@@ -1,5 +1,8 @@
 package io.github.adainish.velobbity;
 
+import com.google.common.collect.ImmutableList;
+import com.google.gson.JsonElement;
+import com.google.gson.reflect.TypeToken;
 import com.google.inject.Inject;
 import com.velocitypowered.api.event.connection.DisconnectEvent;
 import com.velocitypowered.api.event.connection.PostLoginEvent;
@@ -7,6 +10,7 @@ import com.velocitypowered.api.event.player.ServerConnectedEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.plugin.Plugin;
+import com.velocitypowered.api.proxy.ProxyServer;
 import io.github.adainish.velobbity.configuration.Config;
 import io.github.adainish.velobbity.data.LobbyServer;
 import io.github.adainish.velobbity.configuration.GSON;
@@ -20,10 +24,16 @@ import org.slf4j.event.Level;
 import us.ajg0702.queue.api.AjQueueAPI;
 import us.ajg0702.queue.api.events.PreQueueEvent;
 import us.ajg0702.queue.api.players.AdaptedPlayer;
+import us.ajg0702.queue.api.queues.QueueServer;
+import us.ajg0702.queue.api.server.AdaptedServer;
 
 import java.io.File;
+import java.lang.reflect.Type;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 @Plugin(
@@ -47,9 +57,27 @@ public class Velobbbity {
     public Config config;
 
     public boolean canLoad = true;
-
+    private ProxyServer server;
     public Logger getLogger() {
         return logger;
+    }
+
+
+    @Inject
+    public Velobbbity(ProxyServer server, Logger logger) {
+        this.server = server;
+        this.logger = logger;
+
+        logger.info("Initialised Velobbities main class.");
+    }
+
+    public JsonElement toJSONElement(List<LobbyServer> lobbyServers) {
+        return GSON.PRETTY_MAIN_GSON().toJsonTree(lobbyServers);
+    }
+
+    public List<LobbyServer> fromJSONElement(JsonElement jsonElement) {
+        Type listType = new TypeToken<List<LobbyServer>>() {}.getType();
+        return GSON.PRETTY_MAIN_GSON().fromJson(jsonElement, listType);
     }
 
     public void setupConfig()
@@ -86,24 +114,31 @@ public class Velobbbity {
 
             this.config = new Config(directory, "config", GSON.PRETTY_MAIN_GSON());
 
-            if (!this.config.hasKey("servers")) {
+            if (!this.config.hasKey("configuration")) {
+                List<LobbyServer> lobbyServers = new ArrayList<>();
                 //set default values for example lobby servers and max players per server
                 for (int i = 1; i < 4; i++) {
                     LobbyServer lobbyServer = new LobbyServer("lobby" + i, 100);
-                    this.config.setSubConfigElement("configuration", "servers", lobbyServer.toJSONElement());
-                    this.config.addSubComment("configuration", "servers", "Server name and max players for lobby server " + i);
+                    lobbyServers.add(lobbyServer);
                     this.configuredLobbyServers.put(lobbyServer.serverName, lobbyServer);
                 }
+                this.config.setSubConfigElement("configuration", "servers", toJSONElement(lobbyServers));
+                this.config.addSubComment("configuration", "servers", "Server name and max players for lobby servers");
                 logger.atLevel(Level.INFO).log("Database configuration file created with default values.");
             } else {
-                this.config.get("configuration").getAsJsonObject().get("servers").getAsJsonObject().entrySet().forEach(entry -> {
-                    LobbyServer lobbyServer = new LobbyServer().fromJSONElement(entry.getValue());
+                //get json object from config file
+                JsonElement configSection = this.config.get("configuration");
+                JsonElement serversSection = configSection.getAsJsonObject().get("servers");
+                List<LobbyServer> lobbyServers = fromJSONElement(serversSection);
+                lobbyServers.forEach(lobbyServer -> {
+                    logger.atLevel(Level.INFO).log("Loaded lobby server: " + lobbyServer.serverName + " with max players: " + lobbyServer.maxPlayers);
                     this.configuredLobbyServers.put(lobbyServer.serverName, lobbyServer);
                 });
+                logger.atLevel(Level.INFO).log("Loaded configuration file and servers.");
             }
         } catch (Exception e) {
             //log that the directory could not be created
-            logger.atLevel(Level.ERROR).log("Could not create configuration directory for Velobbity.");
+            logger.atLevel(Level.ERROR).log(e.getMessage());
             canLoad = false;
         }
     }
@@ -120,9 +155,6 @@ public class Velobbbity {
         this.ajQueueAPI = AjQueueAPI.getInstance();
         this.ajSubscriptionsRegistration();
     }
-
-
-
 
     @Subscribe
     public void onLogin(PostLoginEvent event)
@@ -144,12 +176,17 @@ public class Velobbbity {
         player = !cachedUUIDMappedData.containsKey(uuid) ? new VelobbityPlayer(uuid, username) : cachedUUIDMappedData.get(uuid);
         player.lastServer = event.getServer().getServerInfo().getName();
         cachedUUIDMappedData.put(uuid, player);
-
         //check if a players last server is a lobby server and if their desired server is not a lobby server
         if (configuredLobbyServers.containsKey(player.lastServer) && !configuredLobbyServers.containsKey(player.desiredServer)) {
             //if so, redirect them to their desired server
             AdaptedPlayer adaptedPlayer = AjQueueAPI.getInstance().getPlatformMethods().getPlayer(event.getPlayer().getUniqueId());
-            AjQueueAPI.getInstance().getQueueManager().addToQueue(adaptedPlayer, player.desiredServer);
+            //schedule a 5 second delay to allow data syncs to complete
+            server.getScheduler()
+                    .buildTask(this, () -> {
+                        AjQueueAPI.getInstance().getQueueManager().addToQueue(adaptedPlayer, player.desiredServer);
+                    })
+                    .delay(5, TimeUnit.SECONDS)
+                    .schedule();
         }
     }
 
@@ -172,9 +209,12 @@ public class Velobbbity {
             if (!configuredLobbyServers.containsKey(player.lastServer)) {
                 event.setCancelled(true);
                 //find first available server (that is also configured as a lobby server)
-                if (getAndSendAvailableLobbyServer(event.getPlayer(), player)) {
-                    // if exists, redirect player and inform them why. Then, after 5 seconds, redirect them to the requested server
+                QueueServer queueServer = getAndSendAvailableLobbyServer(event.getPlayer(), player, event.getTarget().getName());
+                if (queueServer != null) {
                     event.getPlayer().sendActionBar(Component.text("Redirecting to lobby server...").style(Style.style(TextColor.color(0x00FF00))));
+                    // if exists, redirect player and inform them why.
+                    AdaptedServer adaptedServer = ajQueueAPI.getPlatformMethods().getServer(queueServer.getName());
+                    event.getPlayer().connect(adaptedServer);
                 } else //if no available server exists, send below message to player
                     event.getPlayer().sendActionBar(Component.text("No available lobby servers. Please try again later.").style(Style.style(TextColor.color(0xFF0000))));
             }
@@ -184,22 +224,27 @@ public class Velobbbity {
     }
 
     //method to get first available lobby server to distribute player
-    public boolean getAndSendAvailableLobbyServer(AdaptedPlayer player, VelobbityPlayer velobbityPlayer) {
-        AtomicBoolean done = new AtomicBoolean(false);
-        ajQueueAPI.getQueueManager().getServers().forEach(server -> {
-            if (configuredLobbyServers.containsKey(server.getName())) {
-                //check if server is full
-                if (server.isOnline() && server.isJoinable(player)) {
-                    AjQueueAPI.getInstance().getQueueManager().addToQueue(player, server);
-                    //adjust velobbity player data
-                    velobbityPlayer.desiredServer = server.getName();
-                    this.cachedUUIDMappedData.put(player.getUniqueId(), velobbityPlayer);
-                    done.set(true);
-                }
 
+    public QueueServer getAndSendAvailableLobbyServer(AdaptedPlayer player, VelobbityPlayer velobbityPlayer, String desiredServer) {
+        QueueServer availableServer = null;
+        ImmutableList<QueueServer> servers = ajQueueAPI.getQueueManager().getServers();
+        for (int i = 0, serversSize = servers.size(); i < serversSize; i++) {
+            QueueServer queueServer = servers.get(i);
+            logger.atLevel(Level.INFO).log("Checking server: " + queueServer.getName());
+            configuredLobbyServers.values().forEach(lobbyServer -> logger.atLevel(Level.INFO).log("Lobby server: " + lobbyServer.serverName));
+            if (configuredLobbyServers.containsKey(queueServer.getName())) {
+                //check if server is full
+                if (queueServer.isOnline() && queueServer.isJoinable(player)) {
+                    //adjust velobbity player data
+                    velobbityPlayer.lastServer = player.getServerName();
+                    velobbityPlayer.desiredServer = desiredServer;
+                    this.cachedUUIDMappedData.put(player.getUniqueId(), velobbityPlayer);
+                    availableServer = queueServer;
+                    break;
+                }
             }
-        });
-        return done.get();
+        }
+        return availableServer;
     }
 
 }
