@@ -2,10 +2,12 @@ plugins {
     id 'java'
     id 'eclipse'
     id "org.jetbrains.gradle.plugin.idea-ext" version "1.0.1"
+    id "com.github.johnrengelman.shadow" version "8.1.1"
 }
 
 group = 'io.github.adainish'
 version = '1.0.0-SNAPSHOT'
+
 
 repositories {
     mavenCentral()
@@ -14,12 +16,18 @@ repositories {
         url = "https://repo.papermc.io/repository/maven-public/"
     }
     maven { url 'https://repo.ajg0702.us/releases' }
+    maven {
+        name = "redis"
+        url = "https://mvnrepository.com/artifact/redis.clients/jedis"
+    }
 }
 
 dependencies {
     compileOnly "com.velocitypowered:velocity-api:3.3.0-SNAPSHOT"
     annotationProcessor "com.velocitypowered:velocity-api:3.3.0-SNAPSHOT"
     compileOnly 'us.ajg0702.queue.api:api:2.7.0'
+    implementation 'redis.clients:jedis:5.2.0-beta4'
+    shadow group: 'redis.clients', name: 'jedis', version: '5.2.0-beta4'
 }
 
 def targetJavaVersion = 17
@@ -57,3 +65,17 @@ sourceSets.main.java.srcDir(generateTemplates.map { it.outputs })
 
 rootProject.idea.project.settings.taskTriggers.afterSync generateTemplates
 project.eclipse.synchronizationTasks(generateTemplates)
+
+configurations {
+    provided
+    compile.extendsFrom provided
+}
+
+shadowJar {
+    configurations = [project.configurations.shadow]
+
+    //relocate jedis
+    relocate("redis.clients", "io.github.adainish.redis.clients")
+}
+
+build.dependsOn shadowJar

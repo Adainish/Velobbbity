@@ -26,5 +26,10 @@
       <option name="name" value="maven" />
       <option name="url" value="https://repo.ajg0702.us/releases" />
     </remote-repository>
+    <remote-repository>
+      <option name="id" value="redis" />
+      <option name="name" value="redis" />
+      <option name="url" value="https://mvnrepository.com/artifact/redis.clients/jedis" />
+    </remote-repository>
   </component>
 </project>

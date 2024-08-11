@@ -21,6 +21,10 @@ import net.kyori.adventure.text.format.TextColor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.event.Level;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.JedisPubSub;
 import us.ajg0702.queue.api.AjQueueAPI;
 import us.ajg0702.queue.api.events.PreQueueEvent;
 import us.ajg0702.queue.api.players.AdaptedPlayer;
@@ -29,6 +33,7 @@ import us.ajg0702.queue.api.server.AdaptedServer;
 
 import java.io.File;
 import java.lang.reflect.Type;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -53,8 +58,8 @@ public class Velobbbity {
 
     public static Velobbbity instance;
     public AjQueueAPI ajQueueAPI;
+    public JedisPool jedisPool;
     public Config config;
-
     public boolean canLoad = true;
     private ProxyServer server;
     public Logger getLogger() {
@@ -135,11 +140,67 @@ public class Velobbbity {
                 });
                 logger.atLevel(Level.INFO).log("Loaded configuration file and servers.");
             }
+            //redis connection
+            if (!this.config.hasKey("redis")) {
+                this.config.setSubConfigElement("redis", "host", "localhost");
+                this.config.setSubConfigElement("redis", "port", 6379);
+                this.config.setSubConfigElement("redis", "password", "");
+                this.config.setSubConfigElement("redis", "database", 0);
+                logger.atLevel(Level.INFO).log("Redis configuration file created with default values.");
+            } else {
+                //get json object from config file
+                JsonElement configSection = this.config.get("redis");
+                String host = configSection.getAsJsonObject().get("host").getAsString();
+                int port = configSection.getAsJsonObject().get("port").getAsInt();
+                String password = configSection.getAsJsonObject().get("password").getAsString();
+                int database = configSection.getAsJsonObject().get("database").getAsInt();
+                logger.atLevel(Level.INFO).log("Loaded redis configuration.");
+
+//                try {
+//                    Jedis jSubscriber = new Jedis(host, port, 10000);
+//                    jSubscriber.subscribe(new PlayerStatusSubscriber(), "playerStatusUpdates");
+//                } catch (Exception e) {
+//                    logger.atLevel(Level.ERROR).log(e.getMessage());
+//                }
+
+                final JedisPoolConfig poolConfig = buildPoolConfig();
+                this.jedisPool = new JedisPool(poolConfig, host, port, 1000, password, database);
+                this.subscribeToPlayerStatusUpdates();
+            }
         } catch (Exception e) {
             //log that the directory could not be created
             logger.atLevel(Level.ERROR).log(e.getMessage());
             canLoad = false;
         }
+    }
+
+    public void sendPlayerUpdateStatus(UUID playerId, String status) {
+        try (Jedis jedis = jedisPool.getResource()) {
+            jedis.publish("playerStatusUpdates", playerId.toString() + ":" + status);
+        }
+    }
+
+    // Method to receive player's update status
+    public String receivePlayerUpdateStatus(UUID playerId) {
+        try (Jedis jedis = jedisPool.getResource()) {
+            String status = jedis.get(playerId.toString());
+            return status != null ? status : "";
+        }
+    }
+
+    private JedisPoolConfig buildPoolConfig() {
+        final JedisPoolConfig poolConfig = new JedisPoolConfig();
+        poolConfig.setMaxTotal(128);
+        poolConfig.setMaxIdle(128);
+        poolConfig.setMinIdle(16);
+        poolConfig.setTestOnBorrow(true);
+        poolConfig.setTestOnReturn(true);
+        poolConfig.setTestWhileIdle(true);
+        poolConfig.setMinEvictableIdleTimeMillis(Duration.ofSeconds(60).toMillis());
+        poolConfig.setTimeBetweenEvictionRunsMillis(Duration.ofSeconds(30).toMillis());
+        poolConfig.setNumTestsPerEvictionRun(3);
+        poolConfig.setBlockWhenExhausted(true);
+        return poolConfig;
     }
 
     @Subscribe
@@ -216,10 +277,55 @@ public class Velobbbity {
                     event.getPlayer().connect(adaptedServer);
                 } else //if no available server exists, send below message to player
                     event.getPlayer().sendActionBar(Component.text("No available lobby servers. Please try again later.").style(Style.style(TextColor.color(0xFF0000))));
+            } else {
+                //delay queue until safe
+                if (jedisPool != null) {
+                    String status = receivePlayerUpdateStatus(event.getPlayer().getUniqueId());
+                    if (status == null || status.isEmpty() || status.isBlank()) {
+                        return;
+                    }
+                } else {
+                    //schedule for 2 seconds to try again
+                    VelobbityPlayer finalPlayer = player;
+                    server.getScheduler()
+                            .buildTask(this, () -> {
+                                ajQueueAPI.getQueueManager().addToQueue(event.getPlayer(), finalPlayer.desiredServer);
+                            })
+                            .delay(2, TimeUnit.SECONDS)
+                            .schedule();
+                }
             }
-
-
         });
+    }
+
+    public void redirect(UUID uuid)
+    {
+        VelobbityPlayer player = cachedUUIDMappedData.get(uuid);
+        if (player == null) {
+            player = new VelobbityPlayer(uuid, "");
+            cachedUUIDMappedData.put(uuid, player);
+        }
+        AdaptedPlayer adaptedPlayer = AjQueueAPI.getInstance().getPlatformMethods().getPlayer(uuid);
+        redirectPlayerToLobbyServer(adaptedPlayer, player, player.desiredServer);
+    }
+
+    public boolean redirectPlayerToLobbyServer(AdaptedPlayer player, VelobbityPlayer velobbityPlayer, String desiredServer) {
+        boolean success = false;
+        QueueServer queueServer = getAndSendAvailableLobbyServer(player, velobbityPlayer, desiredServer);
+        if (queueServer != null) {
+            success = true;
+            AdaptedServer adaptedServer = ajQueueAPI.getPlatformMethods().getServer(queueServer.getName());
+            player.connect(adaptedServer);
+        } else {
+            //schedule for 2 seconds to try again
+            server.getScheduler()
+                    .buildTask(this, () -> {
+                        redirectPlayerToLobbyServer(player, velobbityPlayer, desiredServer);
+                    })
+                    .delay(2, TimeUnit.SECONDS)
+                    .schedule();
+        }
+        return success;
     }
 
     public QueueServer getAndSendAvailableLobbyServer(AdaptedPlayer player, VelobbityPlayer velobbityPlayer, String desiredServer) {
@@ -242,4 +348,17 @@ public class Velobbbity {
         return availableServer;
     }
 
+    public void subscribeToPlayerStatusUpdates() {
+        new Thread(() -> {
+            try (Jedis jedis = jedisPool.getResource()) {
+                logger.info("Subscribing to player status updates.");
+                //state of jedis
+                logger.info("JedisPool state: " + (jedisPool.isClosed() ? "closed" : "open"));
+                logger.info("Jedis pool active: " + jedisPool.getNumActive());
+                jedis.subscribe(new PlayerStatusSubscriber(), "playerStatusUpdates");
+            } catch (Exception e) {
+                logger.atLevel(Level.ERROR).log(e.getMessage());
+            }
+        }).start();
+    }
 }
